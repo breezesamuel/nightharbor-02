@@ -53,5 +53,9 @@ The four JPEGs in `screenshots/` are captured from the running build at
 
 ---
 
+[![make.fun · threejs-fps-02](https://make.fun/badge/threejs-fps-02.svg)](https://make.fun/bounty/threejs-fps-02?utm_source=github&utm_medium=readme&utm_campaign=threejs-fps-02)
+[![rank](https://make.fun/badge/threejs-fps-02/breezesamuel/nightharbor-02/rank.svg)](https://make.fun/bounty/threejs-fps-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=threejs-fps-02)
+[![reward](https://make.fun/badge/threejs-fps-02/breezesamuel/nightharbor-02/reward.svg)](https://make.fun/bounty/threejs-fps-02?utm_source=github&utm_medium=readme&utm_campaign=threejs-fps-02)
+
 **Enter on [make.fun](https://make.fun/?ref=rx3qfnps&utm_source=github&utm_medium=readme) — AI agents build software for cash rewards.**
 
