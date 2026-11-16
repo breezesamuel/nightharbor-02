@@ -2,13 +2,85 @@
 // Owns: turning mapdata.js into meshes, colliders, shootables, nav, sites, lamps,
 // atmosphere, water and charge strips. Everything is static; step(dt) animates only
 // water drift and strip pulse with zero allocation, updateShadows() is a reserved no-op.
+//
+// Module map:
+//   1. seeded noise + canvas baking ............ mulberry32, paintCanvas, bake
+//   2. procedural painters ..................... one painter per surface kind
+//   3. texture and material caches ............. bake(), makeMaterial(), materialFor()
+//   4. texel density ........................... repeatsFor()
+//   5. props ................................... puddleMat(), buildProps()
+//   6. signs ................................... paintSign(), buildSigns()
+//   7. water ................................... buildWater()
+//   8. atmosphere .............................. buildSky(), buildLighting()
+//   9. entry point ............................. createWorld()
 import * as THREE from 'three';
 import { BOXES, PROPS, SIGNS, LAMPS, NAV, SITES, SPAWNS } from './mapdata.js';
 import { PALETTE } from './palette.js';
 
-// ---- texture plumbing: seeded bakes + shared material cache ----
-// A tiny mulberry generator keeps every procedural surface pixel-identical on each load,
-// so screenshots and the world stay stable between sessions.
+// ---- shared numeric constants -------------------------------------------------
+// Every tunable lives here so the painters and builders below read as intent
+// rather than as columns of unexplained numbers.
+
+const TAU = Math.PI * 2;
+const HALF_PI = Math.PI / 2;
+
+// Bake sizes. Large surfaces get 512, small trim/hazard plates 256, the lamp
+// glow 64 (it is a smooth gradient and gains nothing from more texels).
+const TEXTURE_SIZE = 512;
+const SMALL_TEXTURE_SIZE = 256;
+const LAMP_TEXTURE_SIZE = 64;
+const SKY_TEXTURE_SIZE = 256;
+
+// Canvas bake grade: a night scene is dark because of its light budget, not
+// because its albedo is charcoal, so each bake is lifted once after painting.
+const BAKE_LIFT = 2.4;
+const BAKE_CONTRAST = 1.06;
+
+// A fixed, modest anisotropy. Textures are baked once at module load (and cached
+// by kind), so the value cannot be raised later from the renderer's limits.
+const ANISO = 4;
+
+// Light budget.
+const MAX_POINT_LIGHTS = 8;
+const LAMP_GAIN = 40;
+
+// Water and sky extents.
+const WATER_SIZE = 420;
+const WATER_Y = -0.35;
+const WATER_REPEAT = 40;
+const DEEP_SIZE = 700;
+const DEEP_Y = -0.4;
+const SKY_RADIUS = 400;
+const FOG_NEAR = 40;
+const FOG_FAR = 220;
+
+// Level bounds handed to gameplay code (respawn clamps, HUD map).
+const BOUNDS_MIN = { x: -28, y: 0, z: -36 };
+const BOUNDS_MAX = { x: 28, y: 7, z: 36 };
+
+// Charge-strip pulse: ~2.2 Hz, colour scaled between roughly 0.45x and 1.35x.
+const STRIP_PULSE_HZ = 2.2;
+const STRIP_PULSE_MIN = 0.45;
+const STRIP_PULSE_AMP = 0.9;
+
+// Water drift, in UV units per second.
+const DRIFT_A_X = 0.004;
+const DRIFT_B_X = -0.0027;
+const DRIFT_B_Y = 0.0019;
+
+// Box ids that identify the two charge strips; matched by prefix.
+const STRIP_ID_PREFIXES = ['a-charge-strip', 'b-charge-strip'];
+const GROUND_BOX_ID = 'ground';
+const CHARGE_CRATE_BY_SITE = { a: 'a-charge', b: 'b-charge' };
+
+// ---- 1. seeded noise + canvas baking ------------------------------------------
+
+/**
+ * Tiny mulberry32 PRNG. The level must look pixel-identical on every load, so
+ * every painter seeds its own stream instead of using Math.random.
+ * @param {number} seed any 32-bit integer
+ * @returns {() => number} generator in [0, 1)
+ */
 function mulberry32(seed) {
   let a = seed;
   return function () {
@@ -20,29 +92,45 @@ function mulberry32(seed) {
   };
 }
 
-// module-level anisotropy; raised later once the renderer's limits are known
-let ANISO = 4;
-
-// Bake a canvas into a texture configured once at module load: repeated, sRGB,
-// mipmap-filtered so large flat surfaces (asphalt, concrete) stay clean at a distance.
-function bakeTexture(size, painter, lift = 2.4) {
+/**
+ * Paint one square canvas of the given size and optionally lift it once.
+ * @param {number} size canvas edge in pixels
+ * @param {(ctx: CanvasRenderingContext2D, size: number) => void} painter
+ * @param {number} [lift] brightness multiplier; 1 skips the lift pass (already hot)
+ * @returns {HTMLCanvasElement}
+ */
+function paintCanvas(size, painter, lift = BAKE_LIFT) {
   const canvas = document.createElement('canvas');
   canvas.width = size;
   canvas.height = size;
   const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('world: 2D canvas context unavailable');
   painter(ctx, size);
-  // A night scene is dark because of its light budget, not because its albedo is charcoal.
-  // Lift the bake once, after painting, so every painter keeps its own relative contrast and
-  // the key light has something to reflect; the lamp bake is already hot and skips this.
+
+  // Lift after painting so every painter keeps its own relative contrast and the
+  // key light has something to reflect.
   if (lift !== 1) {
     const copy = document.createElement('canvas');
     copy.width = size;
     copy.height = size;
     const cctx = copy.getContext('2d');
-    cctx.filter = `brightness(${lift}) contrast(1.06)`;
-    cctx.drawImage(canvas, 0, 0);
-    ctx.drawImage(copy, 0, 0);
+    if (cctx) {
+      cctx.filter = `brightness(${lift}) contrast(${BAKE_CONTRAST})`;
+      cctx.drawImage(canvas, 0, 0);
+      ctx.clearRect(0, 0, size, size);
+      ctx.drawImage(copy, 0, 0);
+    }
   }
+  return canvas;
+}
+
+/**
+ * Wrap a baked canvas in a texture configured once: repeated, sRGB, mipmap-filtered
+ * so large flat surfaces (asphalt, concrete) stay clean at a distance.
+ * @param {HTMLCanvasElement} canvas
+ * @returns {THREE.CanvasTexture}
+ */
+function textureFromCanvas(canvas) {
   const tex = new THREE.CanvasTexture(canvas);
   tex.wrapS = THREE.RepeatWrapping;
   tex.wrapT = THREE.RepeatWrapping;
@@ -54,8 +142,21 @@ function bakeTexture(size, painter, lift = 2.4) {
   return tex;
 }
 
-// ---- procedural paint: each surface is a seeded canvas bake ----
+/**
+ * Paint and wrap in one call. Used for one-off textures (water ripples) where a
+ * per-kind canvas cache would only add indirection.
+ * @param {number} size
+ * @param {(ctx: CanvasRenderingContext2D, size: number) => void} painter
+ * @param {number} [lift]
+ * @returns {THREE.CanvasTexture}
+ */
+function bakeTexture(size, painter, lift = BAKE_LIFT) {
+  return textureFromCanvas(paintCanvas(size, painter, lift));
+}
 
+// ---- 2. procedural paint: each surface is a seeded canvas bake ------------------
+
+/** Damp cast concrete: blotchy weathering, aggregate speckle, form lines. */
 function paintConcrete(ctx, s) {
   const rnd = mulberry32(101);
   ctx.fillStyle = '#23292c';
@@ -70,7 +171,7 @@ function paintConcrete(ctx, s) {
     g.addColorStop(1, 'rgba(8, 11, 13, 0)');
     ctx.fillStyle = g;
     ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.arc(x, y, r, 0, TAU);
     ctx.fill();
   }
   for (let i = 0; i < 4000; i++) {
@@ -94,6 +195,7 @@ function paintConcrete(ctx, s) {
   }
 }
 
+/** Standing water film: cool sheen pools, dark pits, thin run-off streaks. */
 function paintWet(ctx, s) {
   const rnd = mulberry32(202);
   ctx.fillStyle = '#1a2226';
@@ -107,13 +209,13 @@ function paintWet(ctx, s) {
     g.addColorStop(1, 'rgba(90, 110, 120, 0)');
     ctx.fillStyle = g;
     ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.arc(x, y, r, 0, TAU);
     ctx.fill();
   }
   for (let i = 0; i < 40; i++) {
     ctx.fillStyle = 'rgba(0,0,0,0.3)';
     ctx.beginPath();
-    ctx.arc(rnd() * s, rnd() * s, 1 + rnd() * 3, 0, Math.PI * 2);
+    ctx.arc(rnd() * s, rnd() * s, 1 + rnd() * 3, 0, TAU);
     ctx.fill();
   }
   // narrow sheen lines: standing water catching the sodium light
@@ -129,6 +231,7 @@ function paintWet(ctx, s) {
   }
 }
 
+/** Harbour asphalt: low-frequency tonal drift, aggregate grit, hairline cracks. */
 function paintAsphalt(ctx, s) {
   const rnd = mulberry32(303);
   ctx.fillStyle = '#14191c';
@@ -143,7 +246,7 @@ function paintAsphalt(ctx, s) {
     g.addColorStop(1, 'rgba(0,0,0,0)');
     ctx.fillStyle = g;
     ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.arc(x, y, r, 0, TAU);
     ctx.fill();
   }
   for (let i = 0; i < 6000; i++) {
@@ -155,7 +258,7 @@ function paintAsphalt(ctx, s) {
   for (let i = 0; i < 2; i++) {
     ctx.fillStyle = 'rgba(140, 140, 135, 0.5)';
     ctx.beginPath();
-    ctx.arc(rnd() * s, rnd() * s, 4 + rnd() * 4, 0, Math.PI * 2);
+    ctx.arc(rnd() * s, rnd() * s, 4 + rnd() * 4, 0, TAU);
     ctx.fill();
   }
   ctx.strokeStyle = 'rgba(0,0,0,0.55)';
@@ -174,6 +277,7 @@ function paintAsphalt(ctx, s) {
   }
 }
 
+/** Corrugated cladding: sixteen ribs, then rust streaks running down from the top. */
 function paintSteel(ctx, s) {
   const rnd = mulberry32(404);
   ctx.fillStyle = '#2b3440';
@@ -199,6 +303,7 @@ function paintSteel(ctx, s) {
   }
 }
 
+/** Oxidised plate: patchy corrosion, a rivet grid on a 64 px pitch, run-down stains. */
 function paintRust(ctx, s) {
   const rnd = mulberry32(505);
   ctx.fillStyle = '#46311f';
@@ -208,7 +313,7 @@ function paintRust(ctx, s) {
     ctx.fillStyle = patches[i % 2];
     ctx.globalAlpha = 0.2 + rnd() * 0.3;
     ctx.beginPath();
-    ctx.arc(rnd() * s, rnd() * s, 10 + rnd() * 55, 0, Math.PI * 2);
+    ctx.arc(rnd() * s, rnd() * s, 10 + rnd() * 55, 0, TAU);
     ctx.fill();
   }
   ctx.globalAlpha = 1;
@@ -217,7 +322,7 @@ function paintRust(ctx, s) {
   for (let y = 32; y < s; y += 64) {
     for (let x = 32; x < s; x += 64) {
       ctx.beginPath();
-      ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+      ctx.arc(x, y, 2.5, 0, TAU);
       ctx.fill();
     }
   }
@@ -232,6 +337,13 @@ function paintRust(ctx, s) {
   }
 }
 
+/**
+ * Ship container side: 24 ribs, a paint patch, a stencilled number and rust bites.
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {number} s canvas edge in pixels
+ * @param {string} base body colour as a CSS colour
+ * @param {number} seed PRNG seed, unique per container colour
+ */
 function paintContainer(ctx, s, base, seed) {
   const rnd = mulberry32(seed);
   ctx.fillStyle = base;
@@ -257,11 +369,12 @@ function paintContainer(ctx, s, base, seed) {
   for (let i = 0; i < 20; i++) {
     ctx.fillStyle = 'rgba(95, 58, 30, 0.35)';
     ctx.beginPath();
-    ctx.arc(rnd() * s, rnd() * s, 3 + rnd() * 9, 0, Math.PI * 2);
+    ctx.arc(rnd() * s, rnd() * s, 3 + rnd() * 9, 0, TAU);
     ctx.fill();
   }
 }
 
+/** Wooden pallet crate: five slats, grain lines, dark nail heads, one brace. */
 function paintCrate(ctx, s) {
   const rnd = mulberry32(606);
   ctx.fillStyle = '#42392c';
@@ -285,8 +398,8 @@ function paintCrate(ctx, s) {
     }
     ctx.fillStyle = 'rgba(15, 10, 6, 0.9)';
     ctx.beginPath();
-    ctx.arc(s * 0.14, y + slat * 0.5, 4, 0, Math.PI * 2);
-    ctx.arc(s * 0.86, y + slat * 0.5, 4, 0, Math.PI * 2);
+    ctx.arc(s * 0.14, y + slat * 0.5, 4, 0, TAU);
+    ctx.arc(s * 0.86, y + slat * 0.5, 4, 0, TAU);
     ctx.fill();
   }
   ctx.strokeStyle = 'rgba(0,0,0,0.5)';
@@ -297,6 +410,7 @@ function paintCrate(ctx, s) {
   ctx.stroke();
 }
 
+/** Hazard chevrons: diagonal black bands on yellow, scuffed by abrasion. */
 function paintHazard(ctx, s) {
   const rnd = mulberry32(707);
   ctx.fillStyle = '#b8912f';
@@ -316,6 +430,7 @@ function paintHazard(ctx, s) {
   }
 }
 
+/** Near-black machinery paint: faint scratches plus a lighter top edge. */
 function paintDark(ctx, s) {
   const rnd = mulberry32(808);
   ctx.fillStyle = '#0c0f12';
@@ -333,6 +448,7 @@ function paintDark(ctx, s) {
   ctx.fillRect(0, 0, s, 3);
 }
 
+/** Lamp lens: hot sodium core fading to amber, no noise (it is seen from far off). */
 function paintLamp(ctx, s) {
   const g = ctx.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
   g.addColorStop(0, '#fff3d6');
@@ -341,138 +457,196 @@ function paintLamp(ctx, s) {
   ctx.fillRect(0, 0, s, s);
 }
 
-function bake(kind) {
-  switch (kind) {
-    case 'concrete':
-      return bakeTexture(512, paintConcrete);
-    case 'wet':
-      return bakeTexture(512, paintWet);
-    case 'asphalt':
-      return bakeTexture(512, paintAsphalt);
-    case 'steel':
-      return bakeTexture(512, paintSteel);
-    case 'rust':
-      return bakeTexture(512, paintRust);
-    case 'containerTeal':
-      return bakeTexture(512, (c, s) => paintContainer(c, s, '#1d5a55', 11));
-    case 'containerOrange':
-      return bakeTexture(512, (c, s) => paintContainer(c, s, '#8a3d1c', 12));
-    case 'containerOlive':
-      return bakeTexture(512, (c, s) => paintContainer(c, s, '#4a4a2a', 13));
-    case 'crate':
-      return bakeTexture(512, paintCrate);
-    case 'hazard':
-      return bakeTexture(256, paintHazard);
-    case 'dark':
-      return bakeTexture(256, paintDark);
-    case 'lamp':
-      return bakeTexture(64, paintLamp, 1);
-    default:
-      throw new Error('unknown texture kind ' + kind);
-  }
+// ---- 3. texture and material caches --------------------------------------------
+
+/**
+ * Bake recipe per surface kind. Each painter is deterministic, so the canvas is
+ * painted once per kind and reused by every material that repeats it.
+ * @type {Record<string, {size: number, paint: Function, lift: number}>}
+ */
+const TEXTURE_SPECS = {
+  concrete: { size: TEXTURE_SIZE, paint: paintConcrete, lift: BAKE_LIFT },
+  wet: { size: TEXTURE_SIZE, paint: paintWet, lift: BAKE_LIFT },
+  asphalt: { size: TEXTURE_SIZE, paint: paintAsphalt, lift: BAKE_LIFT },
+  steel: { size: TEXTURE_SIZE, paint: paintSteel, lift: BAKE_LIFT },
+  rust: { size: TEXTURE_SIZE, paint: paintRust, lift: BAKE_LIFT },
+  containerTeal: { size: TEXTURE_SIZE, paint: (c, s) => paintContainer(c, s, '#1d5a55', 11), lift: BAKE_LIFT },
+  containerOrange: { size: TEXTURE_SIZE, paint: (c, s) => paintContainer(c, s, '#8a3d1c', 12), lift: BAKE_LIFT },
+  containerOlive: { size: TEXTURE_SIZE, paint: (c, s) => paintContainer(c, s, '#4a4a2a', 13), lift: BAKE_LIFT },
+  crate: { size: TEXTURE_SIZE, paint: paintCrate, lift: BAKE_LIFT },
+  hazard: { size: SMALL_TEXTURE_SIZE, paint: paintHazard, lift: BAKE_LIFT },
+  dark: { size: SMALL_TEXTURE_SIZE, paint: paintDark, lift: BAKE_LIFT },
+  lamp: { size: LAMP_TEXTURE_SIZE, paint: paintLamp, lift: 1 },
+};
+
+// One painted canvas per kind: the same surface requested at several repeat
+// values shares the pixels instead of re-running a 512 px bake each time.
+const paintedCanvases = new Map();
+
+/**
+ * Painted canvas for a surface kind, baked on first use.
+ * @param {string} kind key of TEXTURE_SPECS
+ * @returns {HTMLCanvasElement}
+ */
+function canvasFor(kind) {
+  let canvas = paintedCanvases.get(kind);
+  if (canvas) return canvas;
+  const spec = TEXTURE_SPECS[kind];
+  if (!spec) throw new Error('world: unknown texture kind ' + kind);
+  canvas = paintCanvas(spec.size, spec.paint, spec.lift);
+  paintedCanvases.set(kind, canvas);
+  return canvas;
 }
 
-// ---- material cache: one material per (kind, repeatX, repeatY) ----
-// Repeated surfaces share a material so draw calls stay near the ~150 budget;
-// the repeat is baked into the key because texture state lives on the map.
+/**
+ * A fresh texture for a surface kind. Fresh per call because repeat state lives
+ * on the texture, which is exactly what the material cache keys on.
+ * @param {string} kind key of TEXTURE_SPECS
+ * @returns {THREE.CanvasTexture}
+ */
+function bake(kind) {
+  return textureFromCanvas(canvasFor(kind));
+}
+
+// Repeated surfaces share a material so draw calls stay near the budget; the
+// repeat is part of the key because texture state lives on the map.
 const materialCache = new Map();
 
+/**
+ * Build the single material for a surface kind, without repeat state.
+ * @param {string} kind key of TEXTURE_SPECS
+ * @returns {THREE.Material}
+ */
 function makeMaterial(kind) {
-  switch (kind) {
-    case 'lamp': {
-      // lamp fixtures are unlit emissive: basic material, never cast a shadow
-      const m = new THREE.MeshBasicMaterial({ map: bake('lamp') });
-      m.shadowSide = THREE.DoubleSide;
-      return m;
-    }
-    default: {
-      const m = new THREE.MeshStandardMaterial({ map: bake(kind) });
-      switch (kind) {
-        case 'concrete':
-        case 'asphalt':
-          m.roughness = 0.92;
-          m.metalness = 0.02;
-          break;
-        case 'wet':
-          m.roughness = 0.35;
-          m.metalness = 0.1;
-          break;
-        case 'steel':
-        case 'rust':
-          m.roughness = 0.72;
-          m.metalness = 0.45;
-          break;
-        case 'containerTeal':
-        case 'containerOrange':
-        case 'containerOlive':
-          m.roughness = 0.6;
-          m.metalness = 0.35;
-          break;
-        case 'crate':
-          m.roughness = 0.9;
-          m.metalness = 0;
-          break;
-        case 'hazard':
-          m.roughness = 0.8;
-          m.metalness = 0;
-          break;
-        case 'dark':
-          m.roughness = 0.5;
-          m.metalness = 0.4;
-          break;
-        default:
-          break;
-      }
-      return m;
-    }
+  if (kind === 'lamp') {
+    // lamp fixtures are unlit emissive: basic material, never cast a shadow
+    const m = new THREE.MeshBasicMaterial({ map: bake('lamp') });
+    m.shadowSide = THREE.DoubleSide;
+    return m;
   }
+  const m = new THREE.MeshStandardMaterial({ map: bake(kind) });
+  switch (kind) {
+    case 'concrete':
+    case 'asphalt':
+      m.roughness = 0.92;
+      m.metalness = 0.02;
+      break;
+    case 'wet':
+      m.roughness = 0.35;
+      m.metalness = 0.1;
+      break;
+    case 'steel':
+    case 'rust':
+      m.roughness = 0.72;
+      m.metalness = 0.45;
+      break;
+    case 'containerTeal':
+    case 'containerOrange':
+    case 'containerOlive':
+      m.roughness = 0.6;
+      m.metalness = 0.35;
+      break;
+    case 'crate':
+      m.roughness = 0.9;
+      m.metalness = 0;
+      break;
+    case 'hazard':
+      m.roughness = 0.8;
+      m.metalness = 0;
+      break;
+    case 'dark':
+      m.roughness = 0.5;
+      m.metalness = 0.4;
+      break;
+    default:
+      break;
+  }
+  return m;
 }
 
+/**
+ * Cached material for (kind, repeatX, repeatY). Callers must not mutate the
+ * returned material; the charge strips clone theirs before tinting.
+ * @param {string} kind key of TEXTURE_SPECS
+ * @param {number} rx horizontal repeat
+ * @param {number} ry vertical repeat
+ * @returns {THREE.Material}
+ */
 function materialFor(kind, rx, ry) {
   const key = kind + '|' + rx + '|' + ry;
   let mat = materialCache.get(key);
   if (!mat) {
     mat = makeMaterial(kind);
-    mat.map.repeat.set(rx, ry);
-    mat.map.needsUpdate = false;
+    if (mat.map) mat.map.repeat.set(rx, ry);
     materialCache.set(key, mat);
   }
   return mat;
 }
 
-// Texel density: about one texture per 4 m of concrete/asphalt, per 2.6 m of
-// container face, per 1.2 m of crate, per 2 m of steel. For boxes much wider
-// than deep we split the repeat across axes so the long faces stay dense.
+// ---- 4. texel density ----------------------------------------------------------
+
+// About one texture per 4 m of concrete/asphalt, per 2.6 m of container face,
+// per 1.2 m of crate, per 2 m of steel. For boxes much wider than deep the
+// repeat is split across axes so the long faces stay dense.
+const METRES_PER_TILE = {
+  concrete: 4,
+  asphalt: 4,
+  container: 2.6,
+  crate: 1.2,
+  steel: 2,
+  rust: 4,
+  detail: 2,
+};
+
+/**
+ * Repeat counts for a box face of the given size.
+ * @param {string} mat surface kind
+ * @param {number} w width in metres
+ * @param {number} h height in metres
+ * @param {number} d depth in metres
+ * @returns {[number, number]} repeat along the box's u and v axes
+ */
 function repeatsFor(mat, w, h, d) {
+  const tiles = (extent, metres) => Math.max(1, Math.round(extent / metres));
   switch (mat) {
     case 'concrete':
     case 'asphalt':
-      return [Math.max(1, Math.round(w / 4)), Math.max(1, Math.round(h / 4))];
+      return [tiles(w, METRES_PER_TILE.concrete), tiles(h, METRES_PER_TILE.concrete)];
     case 'containerTeal':
     case 'containerOrange':
     case 'containerOlive':
-      return [Math.max(1, Math.round(d / 2.6)), Math.max(1, Math.round(w / 2.6))];
+      return [tiles(d, METRES_PER_TILE.container), tiles(w, METRES_PER_TILE.container)];
     case 'crate':
-      return [Math.max(1, Math.round(d / 1.2)), Math.max(1, Math.round(w / 1.2))];
+      return [tiles(d, METRES_PER_TILE.crate), tiles(w, METRES_PER_TILE.crate)];
     case 'steel':
-      return [Math.max(1, Math.round(d / 2)), Math.max(1, Math.round(w / 2))];
+      return [tiles(d, METRES_PER_TILE.steel), tiles(w, METRES_PER_TILE.steel)];
     case 'rust':
-      return [Math.max(1, Math.round(w / 4)), Math.max(1, Math.round(h / 4))];
+      return [tiles(w, METRES_PER_TILE.rust), tiles(h, METRES_PER_TILE.rust)];
     case 'wet':
     case 'hazard':
     case 'dark':
-      return [Math.max(1, Math.round(w / 2)), Math.max(1, Math.round(d / 2))];
+      return [tiles(w, METRES_PER_TILE.detail), tiles(d, METRES_PER_TILE.detail)];
     default:
       return [1, 1];
   }
 }
 
-// ---- props: instanced meshes for the many, single meshes for the few ----
+// ---- 5. props: instanced meshes for the many, single meshes for the few --------
 // Instancing keeps bollards, rings, cones and pallets at one draw call each;
 // barrels, cables, lampheads and hooks vary too much in grouping to instance cleanly.
 
-// Puddles reuse the wet map but with their own translucent state: depthWrite off and a
-// polygon offset keep them from z-fighting the ground slab underneath.
+const PUDDLE_RADIUS = 0.7; // at scale 1, before the per-prop radius term
+const PUDDLE_RADIUS_GAIN = 0.5;
+const PUDDLE_LIFT = 0.02;
+const PALLET_RUNNER_Z = 0.3;
+const PALLET_RUNNER_Y = 0.02;
+
+/**
+ * Puddles reuse the wet map but with their own translucent state: depthWrite off
+ * and a polygon offset keep them from z-fighting the ground slab underneath.
+ * @param {THREE.Material} wetMat cached wet material whose map is shared
+ * @returns {THREE.MeshStandardMaterial}
+ */
 function puddleMat(wetMat) {
   return new THREE.MeshStandardMaterial({
     map: wetMat.map,
@@ -487,8 +661,14 @@ function puddleMat(wetMat) {
   });
 }
 
+/**
+ * Build every decorative prop from the PROPS table and return the meshes bullets
+ * may stop on (pallet slabs/runners and barrel parts).
+ * @param {THREE.Group} group level group to add meshes to
+ * @returns {THREE.Object3D[]} meshes that belong in world.shootables
+ */
 function buildProps(group) {
-  const stopMats = materialFor('steel', 2, 1);
+  const steelMat = materialFor('steel', 2, 1);
   const rustMat = materialFor('rust', 2, 1);
   const darkMat = materialFor('dark', 1, 1);
   const hazardMat = materialFor('hazard', 2, 1);
@@ -497,8 +677,18 @@ function buildProps(group) {
   const whiteMat = new THREE.MeshStandardMaterial({ color: 0xd8d4cc, roughness: 0.6, metalness: 0 });
 
   const dummy = new THREE.Object3D();
+  const runnerMatrix = new THREE.Matrix4();
+  const runnerOffset = new THREE.Matrix4();
   const shootableProps = [];
 
+  /**
+   * Place one instanced mesh per prop kind that has entries in PROPS.
+   * @param {string} kind PROPS kind to batch
+   * @param {THREE.BufferGeometry} geometry shared geometry
+   * @param {THREE.Material} material shared material
+   * @param {number} yOff vertical offset, scaled by the prop's scale
+   * @param {boolean} cast whether the batch casts shadows
+   */
   function placeInstanced(kind, geometry, material, yOff, cast) {
     const list = PROPS.filter((p) => p.kind === kind);
     if (!list.length) return;
@@ -506,9 +696,10 @@ function buildProps(group) {
     mesh.castShadow = cast;
     mesh.receiveShadow = true;
     list.forEach((p, i) => {
-      dummy.position.set(p.x, p.y + yOff * p.scale, p.z);
+      const s = p.scale || 1;
+      dummy.position.set(p.x, p.y + yOff * s, p.z);
       dummy.rotation.set(0, p.ry || 0, 0);
-      dummy.scale.setScalar(p.scale || 1);
+      dummy.scale.setScalar(s);
       dummy.updateMatrix();
       mesh.setMatrixAt(i, dummy.matrix);
     });
@@ -516,86 +707,92 @@ function buildProps(group) {
   }
 
   // bollard: squat tapered steel cylinder, castShadow true
-  placeInstanced(
-    'bollard',
-    new THREE.CylinderGeometry(0.18, 0.22, 0.55, 12),
-    stopMats,
-    0.275,
-    true
-  );
+  placeInstanced('bollard', new THREE.CylinderGeometry(0.18, 0.22, 0.55, 12), steelMat, 0.275, true);
   // ring: rust torus laid flat, never casts
   placeInstanced('ring', new THREE.TorusGeometry(0.3, 0.05, 8, 24), rustMat, 0.05, false);
+
   // cone: traffic cone with a white band ring
   {
     const cones = PROPS.filter((p) => p.kind === 'cone');
-    const body = new THREE.InstancedMesh(
-      new THREE.ConeGeometry(0.28, 0.7, 14),
-      hazardMat,
-      cones.length
-    );
-    body.castShadow = true;
-    const band = new THREE.InstancedMesh(
-      new THREE.CylinderGeometry(0.19, 0.22, 0.12, 14, 1, true),
-      whiteMat,
-      cones.length
-    );
-    band.castShadow = true;
-    cones.forEach((p, i) => {
-      const s = p.scale || 1;
-      dummy.position.set(p.x, p.y + 0.35 * s, p.z);
-      dummy.rotation.set(0, p.ry || 0, 0);
-      dummy.scale.setScalar(s);
-      dummy.updateMatrix();
-      body.setMatrixAt(i, dummy.matrix);
-      dummy.position.y = p.y + 0.42 * s;
-      dummy.updateMatrix();
-      band.setMatrixAt(i, dummy.matrix);
-    });
-    group.add(body, band);
+    if (cones.length) {
+      const body = new THREE.InstancedMesh(
+        new THREE.ConeGeometry(0.28, 0.7, 14),
+        hazardMat,
+        cones.length
+      );
+      body.receiveShadow = true;
+      body.castShadow = true;
+      const band = new THREE.InstancedMesh(
+        new THREE.CylinderGeometry(0.19, 0.22, 0.12, 14, 1, true),
+        whiteMat,
+        cones.length
+      );
+      band.receiveShadow = true;
+      band.castShadow = true;
+      cones.forEach((p, i) => {
+        const s = p.scale || 1;
+        dummy.position.set(p.x, p.y + 0.35 * s, p.z);
+        dummy.rotation.set(0, p.ry || 0, 0);
+        dummy.scale.setScalar(s);
+        dummy.updateMatrix();
+        body.setMatrixAt(i, dummy.matrix);
+        dummy.position.y = p.y + 0.42 * s;
+        dummy.updateMatrix();
+        band.setMatrixAt(i, dummy.matrix);
+      });
+      group.add(body, band);
+    }
   }
+
   // pallet: slab plus two runner boxes; bullets stop on these
   {
     const pallets = PROPS.filter((p) => p.kind === 'pallet');
-    const top = new THREE.InstancedMesh(new THREE.BoxGeometry(1.2, 0.08, 0.8), crateMat, pallets.length);
-    const runners = new THREE.InstancedMesh(new THREE.BoxGeometry(1.2, 0.06, 0.1), crateMat, pallets.length * 2);
-    top.castShadow = true;
-    runners.castShadow = true;
-    top.receiveShadow = true;
-    runners.receiveShadow = true;
-    pallets.forEach((p, i) => {
-      const s = p.scale || 1;
-      dummy.position.set(p.x, p.y + 0.07 * s, p.z);
-      dummy.rotation.set(0, p.ry || 0, 0);
-      dummy.scale.setScalar(s);
-      dummy.updateMatrix();
-      top.setMatrixAt(i, dummy.matrix);
-      for (let r = 0; r < 2; r++) {
-        dummy.position.y = p.y + 0.02 * s;
+    if (pallets.length) {
+      const top = new THREE.InstancedMesh(new THREE.BoxGeometry(1.2, 0.08, 0.8), crateMat, pallets.length);
+      const runners = new THREE.InstancedMesh(
+        new THREE.BoxGeometry(1.2, 0.06, 0.1),
+        crateMat,
+        pallets.length * 2
+      );
+      top.castShadow = true;
+      runners.castShadow = true;
+      top.receiveShadow = true;
+      runners.receiveShadow = true;
+      pallets.forEach((p, i) => {
+        const s = p.scale || 1;
+        dummy.position.set(p.x, p.y + 0.07 * s, p.z);
+        dummy.rotation.set(0, p.ry || 0, 0);
+        dummy.scale.setScalar(s);
         dummy.updateMatrix();
-        const m = new THREE.Matrix4().copy(dummy.matrix);
-        const off = new THREE.Matrix4().makeTranslation(0, 0, (r ? 0.3 : -0.3) * s);
-        m.multiply(off);
-        runners.setMatrixAt(i * 2 + r, m);
-      }
-    });
-    group.add(top, runners);
-    shootableProps.push(top, runners);
+        top.setMatrixAt(i, dummy.matrix);
+        for (let r = 0; r < 2; r++) {
+          dummy.position.y = p.y + PALLET_RUNNER_Y * s;
+          dummy.updateMatrix();
+          runnerMatrix.copy(dummy.matrix);
+          runnerOffset.makeTranslation(0, 0, (r ? PALLET_RUNNER_Z : -PALLET_RUNNER_Z) * s);
+          runnerMatrix.multiply(runnerOffset);
+          runners.setMatrixAt(i * 2 + r, runnerMatrix);
+        }
+      });
+      group.add(top, runners);
+      shootableProps.push(top, runners);
+    }
   }
 
   // barrel: rust cylinder with two darker bands; bullets stop on it
   {
     const barrels = PROPS.filter((p) => p.kind === 'barrel');
+    const bandGeo = new THREE.TorusGeometry(0.305, 0.025, 8, 24);
     barrels.forEach((p) => {
       const s = p.scale || 1;
       const g = new THREE.Group();
       const body = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, 0.9, 16), rustMat);
       body.position.y = 0.45;
-      const bandGeo = new THREE.TorusGeometry(0.305, 0.025, 8, 24);
       const b1 = new THREE.Mesh(bandGeo, darkMat);
-      b1.rotation.x = Math.PI / 2;
+      b1.rotation.x = HALF_PI;
       b1.position.y = 0.3;
       const b2 = new THREE.Mesh(bandGeo, darkMat);
-      b2.rotation.x = Math.PI / 2;
+      b2.rotation.x = HALF_PI;
       b2.position.y = 0.6;
       g.add(body, b1, b2);
       g.position.set(p.x, p.y, p.z);
@@ -641,13 +838,13 @@ function buildProps(group) {
   PROPS.filter((p) => p.kind === 'hook').forEach((p) => {
     const s = p.scale || 1;
     const g = new THREE.Group();
-    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.09, 0.02, 6, 14), stopMats);
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.09, 0.02, 6, 14), steelMat);
     ring.castShadow = true;
     g.add(ring);
     for (let i = 0; i < 3; i++) {
-      const link = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.02, 0.2, 6), stopMats);
+      const link = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.02, 0.2, 6), steelMat);
       link.position.y = -0.2 * (i + 1);
-      link.rotation.x = i % 2 ? Math.PI / 2 : 0;
+      link.rotation.x = i % 2 ? HALF_PI : 0;
       link.castShadow = true;
       g.add(link);
     }
@@ -656,16 +853,16 @@ function buildProps(group) {
     group.add(g);
   });
 
-  // puddle: wet disc floating 0.02 above the ground; depthWrite off so it never z-fights
+  // puddle: wet disc floating just above the ground; depthWrite off so it never
+  // z-fights. All puddles share one translucent material.
+  let sharedPuddleMat = null;
   PROPS.filter((p) => p.kind === 'puddle').forEach((p) => {
     const s = p.scale || 1;
-    const r = 0.7 + s * 0.5; // 1.4-2.6 m across
-    const puddle = new THREE.Mesh(
-      new THREE.CircleGeometry(r, 24),
-      puddleMat(materialFor('wet', 1, 1))
-    );
-    puddle.rotation.x = -Math.PI / 2;
-    puddle.position.set(p.x, p.y + 0.02, p.z);
+    const r = PUDDLE_RADIUS + s * PUDDLE_RADIUS_GAIN; // ~1.4-2.6 m across
+    if (!sharedPuddleMat) sharedPuddleMat = puddleMat(materialFor('wet', 1, 1));
+    const puddle = new THREE.Mesh(new THREE.CircleGeometry(r, 24), sharedPuddleMat);
+    puddle.rotation.x = -HALF_PI;
+    puddle.position.set(p.x, p.y + PUDDLE_LIFT, p.z);
     puddle.renderOrder = 2;
     group.add(puddle);
   });
@@ -673,41 +870,56 @@ function buildProps(group) {
   return shootableProps;
 }
 
-// ---- signs: painted plates on double-sided quads, never colliders ----
+// ---- 6. signs: painted plates on double-sided quads, never colliders -----------
+
+const SIGN_DEFAULT_W = 2;
+const SIGN_DEFAULT_H = 1;
+const SIGN_FONT_PX = 72;
+const SIGN_GAP_PX = 14;
+const SIGN_LINE_HEIGHT_PX = 110;
+
+/**
+ * Paint one sign plate: dark backing, letter-spaced uppercase text, worn specks.
+ * @param {string} text plate copy; a space splits it over two lines
+ * @param {string} colourName PALETTE key for the lettering
+ * @param {boolean} twoLine whether to split the text across two lines
+ * @returns {THREE.CanvasTexture}
+ */
 function paintSign(text, colourName, twoLine) {
   const h = twoLine ? 256 : 128;
+  const w = 512;
   const canvas = document.createElement('canvas');
-  canvas.width = 512;
+  canvas.width = w;
   canvas.height = h;
   const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, 512, h);
+  if (!ctx) throw new Error('world: 2D canvas context unavailable');
+  ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = 'rgba(5, 8, 10, 0.85)';
-  ctx.fillRect(0, 0, 512, h);
-  const rnd = mulberry32(text.length * 31);
-  const lines = twoLine ? text.split(' ', 2) : [text];
-  const colour = new THREE.Color(PALETTE[colourName]);
+  ctx.fillRect(0, 0, w, h);
+  const rnd = mulberry32(String(text).length * 31);
+  const lines = twoLine ? String(text).split(' ', 2) : [String(text)];
+  const colour = new THREE.Color(PALETTE[colourName] || PALETTE.ink);
   ctx.fillStyle = '#' + colour.getHexString();
-  ctx.font = 'bold 72px monospace';
+  ctx.font = 'bold ' + SIGN_FONT_PX + 'px monospace';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   // letter-spaced uppercase: draw char by char with a fixed gap
   lines.forEach((line, li) => {
     const chars = line.toUpperCase().split('');
-    const gap = 14;
     let width = 0;
-    for (const ch of chars) width += ctx.measureText(ch).width + gap;
-    let x = 256 - width / 2;
-    const y = twoLine ? 64 + li * 110 : h / 2;
+    for (const ch of chars) width += ctx.measureText(ch).width + SIGN_GAP_PX;
+    let x = w / 2 - width / 2;
+    const y = twoLine ? 64 + li * SIGN_LINE_HEIGHT_PX : h / 2;
     for (const ch of chars) {
       ctx.fillText(ch, x + ctx.measureText(ch).width / 2, y);
-      x += ctx.measureText(ch).width + gap;
+      x += ctx.measureText(ch).width + SIGN_GAP_PX;
     }
   });
   // a few erase specks: worn plate
   for (let i = 0; i < 10; i++) {
     ctx.fillStyle = 'rgba(5, 8, 10, ' + (0.4 + rnd() * 0.4) + ')';
     ctx.beginPath();
-    ctx.arc(rnd() * 512, rnd() * h, 2 + rnd() * 5, 0, Math.PI * 2);
+    ctx.arc(rnd() * w, rnd() * h, 2 + rnd() * 5, 0, TAU);
     ctx.fill();
   }
   const tex = new THREE.CanvasTexture(canvas);
@@ -716,10 +928,16 @@ function paintSign(text, colourName, twoLine) {
   return tex;
 }
 
+/**
+ * Build every world-space sign from the SIGNS table (unlit, unlit quads).
+ * @param {THREE.Group} group level group to add meshes to
+ */
 function buildSigns(group) {
   for (const s of SIGNS) {
-    const twoLine = s.text.includes(' ');
-    const geo = new THREE.PlaneGeometry(s.w, s.h);
+    const twoLine = typeof s.text === 'string' && s.text.includes(' ');
+    const w = Number.isFinite(s.w) ? s.w : SIGN_DEFAULT_W;
+    const h = Number.isFinite(s.h) ? s.h : SIGN_DEFAULT_H;
+    const geo = new THREE.PlaneGeometry(w, h);
     const mat = new THREE.MeshBasicMaterial({
       map: paintSign(s.text, s.colour, twoLine),
       transparent: true,
@@ -735,41 +953,54 @@ function buildSigns(group) {
   }
 }
 
-// ---- water: two drifting ripple layers plus a dark depth plane beneath ----
+// ---- 7. water: two drifting ripple layers plus a dark depth plane beneath ------
+
+const RIPPLE_TEXTURE_SIZE = 256;
+
+/**
+ * One ripple layer: faint concentric rings plus short surface strokes, on a
+ * transparent ground so it can be stacked as a map or an emissive map.
+ * @param {number} seed PRNG seed; the two layers use different values
+ * @returns {THREE.CanvasTexture}
+ */
+function rippleTexture(seed) {
+  return bakeTexture(RIPPLE_TEXTURE_SIZE, (ctx, s) => {
+    const rnd = mulberry32(seed);
+    ctx.clearRect(0, 0, s, s);
+    for (let i = 0; i < 24; i++) {
+      const x = rnd() * s;
+      const y = rnd() * s;
+      const r = 8 + rnd() * 30;
+      ctx.strokeStyle = i % 2 ? 'rgba(90, 140, 160, 0.14)' : 'rgba(50, 95, 120, 0.16)';
+      ctx.lineWidth = 1 + rnd() * 1.5;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, TAU);
+      ctx.stroke();
+    }
+    for (let i = 0; i < 26; i++) {
+      const x = rnd() * s;
+      const y = rnd() * s;
+      ctx.strokeStyle = 'rgba(120, 170, 190, 0.1)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + 10 + rnd() * 22, y + (rnd() - 0.5) * 6);
+      ctx.stroke();
+    }
+  });
+}
+
+/**
+ * Build the harbour water: a large rippled plane plus a near-black depth plane.
+ * The two ripple textures are animated by createWorld's step().
+ * @param {THREE.Group} group level group to add meshes to
+ * @returns {{texA: THREE.Texture, texB: THREE.Texture, t: number}}
+ */
 function buildWater(group) {
-  function ripple(seed) {
-    const tex = bakeTexture(256, (ctx, s) => {
-      const rnd = mulberry32(seed);
-      ctx.clearRect(0, 0, s, s);
-      for (let i = 0; i < 24; i++) {
-        const x = rnd() * s;
-        const y = rnd() * s;
-        const r = 8 + rnd() * 30;
-        ctx.strokeStyle = i % 2 ? 'rgba(90, 140, 160, 0.14)' : 'rgba(50, 95, 120, 0.16)';
-        ctx.lineWidth = 1 + rnd() * 1.5;
-        ctx.beginPath();
-        ctx.arc(x, y, r, 0, Math.PI * 2);
-        ctx.stroke();
-      }
-      for (let i = 0; i < 26; i++) {
-        const x = rnd() * s;
-        const y = rnd() * s;
-        ctx.strokeStyle = 'rgba(120, 170, 190, 0.1)';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(x, y);
-        ctx.lineTo(x + 10 + rnd() * 22, y + (rnd() - 0.5) * 6);
-        ctx.stroke();
-      }
-    });
-    tex.wrapS = THREE.RepeatWrapping;
-    tex.wrapT = THREE.RepeatWrapping;
-    return tex;
-  }
-  const texA = ripple(9);
-  const texB = ripple(10);
-  texA.repeat.set(40, 40);
-  texB.repeat.set(40, 40);
+  const texA = rippleTexture(9);
+  const texB = rippleTexture(10);
+  texA.repeat.set(WATER_REPEAT, WATER_REPEAT);
+  texB.repeat.set(WATER_REPEAT, WATER_REPEAT);
   // a second texture on a stacked material: the two layers drift at different rates
   const mat = new THREE.MeshStandardMaterial({
     color: 0x06161a,
@@ -779,66 +1010,179 @@ function buildWater(group) {
   });
   mat.emissiveMap = texB;
   mat.emissive = 0x0a1c22;
-  const plane = new THREE.Mesh(new THREE.PlaneGeometry(420, 420), mat);
-  plane.rotation.x = -Math.PI / 2;
-  plane.position.y = -0.35;
+  const plane = new THREE.Mesh(new THREE.PlaneGeometry(WATER_SIZE, WATER_SIZE), mat);
+  plane.rotation.x = -HALF_PI;
+  plane.position.y = WATER_Y;
   plane.receiveShadow = true;
   group.add(plane);
 
   const deep = new THREE.Mesh(
-    new THREE.PlaneGeometry(700, 700),
+    new THREE.PlaneGeometry(DEEP_SIZE, DEEP_SIZE),
     new THREE.MeshStandardMaterial({ color: 0x03090c, roughness: 0.9, metalness: 0.2 })
   );
-  deep.rotation.x = -Math.PI / 2;
-  deep.position.y = -0.4;
+  deep.rotation.x = -HALF_PI;
+  deep.position.y = DEEP_Y;
   group.add(deep);
 
   return { texA, texB, t: 0 };
 }
 
-// ---- charge strip bookkeeping: the two strip ids are resolved at build time;
-//      step(dt) only scales their existing basic-material colour ----
+// ---- 8. atmosphere: sky dome, key light, fill lights ---------------------------
 
-// ---- main entry: build the whole visible level ----
+/** Vertical night gradient with a low sodium glow on the north side. */
+function buildSky(scene) {
+  const canvas = document.createElement('canvas');
+  canvas.width = SKY_TEXTURE_SIZE;
+  canvas.height = SKY_TEXTURE_SIZE;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('world: 2D canvas context unavailable');
+  const g = ctx.createLinearGradient(0, SKY_TEXTURE_SIZE, 0, 0);
+  g.addColorStop(0, '#060a0c');
+  g.addColorStop(1, '#16242c');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, SKY_TEXTURE_SIZE, SKY_TEXTURE_SIZE);
+  const glow = ctx.createRadialGradient(128, 210, 4, 128, 210, 130);
+  glow.addColorStop(0, 'rgba(255, 178, 87, 0.30)');
+  glow.addColorStop(1, 'rgba(255, 178, 87, 0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, 0, SKY_TEXTURE_SIZE, SKY_TEXTURE_SIZE);
+
+  const skyTex = new THREE.CanvasTexture(canvas);
+  skyTex.colorSpace = THREE.SRGBColorSpace;
+  const dome = new THREE.Mesh(
+    new THREE.SphereGeometry(SKY_RADIUS, 32, 16),
+    new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, fog: false })
+  );
+  scene.add(dome);
+}
+
+/**
+ * Warm shadow-casting key, cool shadowless counter-fill, hemisphere and ambient.
+ * Three.js lights are physical: intensity is candela, so these are authored as
+ * real harbour values rather than 0..1 mixers.
+ * @param {THREE.Scene} scene
+ */
+function buildLighting(scene) {
+  const KEY_COLOUR = 0xffd9a8;
+  const KEY_INTENSITY = 3.4;
+  const KEY_POS = { x: -40, y: 60, z: -50 };
+  const SHADOW_MAP = 2048;
+  const SHADOW_SIDE_X = 34;
+  const SHADOW_SIDE_Z = 44;
+  const SHADOW_NEAR = 1;
+  const SHADOW_FAR = 170;
+  const SHADOW_BIAS = -0.0006;
+  const SHADOW_NORMAL_BIAS = 0.02;
+  const FILL_COLOUR = 0x9fc0dd;
+  const FILL_INTENSITY = 0.6;
+  const FILL_POS = { x: 48, y: 38, z: 62 };
+  const FILL_TARGET = { x: 0, y: 0, z: -6 };
+
+  const sun = new THREE.DirectionalLight(KEY_COLOUR, KEY_INTENSITY);
+  sun.position.set(KEY_POS.x, KEY_POS.y, KEY_POS.z);
+  sun.target.position.set(0, 0, 0);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(SHADOW_MAP, SHADOW_MAP);
+  sun.shadow.camera.left = -SHADOW_SIDE_X;
+  sun.shadow.camera.right = SHADOW_SIDE_X;
+  sun.shadow.camera.top = SHADOW_SIDE_Z;
+  sun.shadow.camera.bottom = -SHADOW_SIDE_Z;
+  sun.shadow.camera.near = SHADOW_NEAR;
+  sun.shadow.camera.far = SHADOW_FAR;
+  sun.shadow.bias = SHADOW_BIAS;
+  sun.shadow.normalBias = SHADOW_NORMAL_BIAS;
+  scene.add(sun, sun.target);
+
+  const hemi = new THREE.HemisphereLight(0x24323c, 0x0a0f12, 1.9);
+  scene.add(hemi);
+  const ambient = new THREE.AmbientLight(0x223038, 0.55);
+  scene.add(ambient);
+
+  // A cool counter-fill with no shadow: the warm key carves the north faces, this keeps
+  // the south and east faces from collapsing into a single black shape at night.
+  const moon = new THREE.DirectionalLight(FILL_COLOUR, FILL_INTENSITY);
+  moon.position.set(FILL_POS.x, FILL_POS.y, FILL_POS.z);
+  moon.target.position.set(FILL_TARGET.x, FILL_TARGET.y, FILL_TARGET.z);
+  moon.castShadow = false;
+  scene.add(moon, moon.target);
+}
+
+// ---- 9. main entry: build the whole visible level -------------------------------
+
+/**
+ * Is this box id one of the two animated charge strips?
+ * @param {string} id box id
+ * @returns {boolean}
+ */
+function isStripId(id) {
+  if (typeof id !== 'string') return false;
+  return STRIP_ID_PREFIXES.some((prefix) => id.indexOf(prefix) === 0);
+}
+
+/**
+ * Build the complete static harbour level and return the handles the rest of the
+ * game reads: collision boxes, bullet targets, the nav graph, site records, spawns,
+ * lamp records, world bounds, the per-frame animator and the shadow-camera seam.
+ *
+ * Everything is added to `scene` (or to one child group of it); nothing here is
+ * disposed, so a world is built once per page load.
+ *
+ * @param {THREE.Scene} scene live scene owned by main.js
+ * @returns {{
+ *   group: THREE.Group,
+ *   colliders: THREE.Box3[],
+ *   shootables: THREE.Object3D[],
+ *   nav: { nodes: object, edges: Array<[string, string]>, byName: object },
+ *   sites: object,
+ *   spawns: object,
+ *   lamps: Array<{ x: number, y: number, z: number, colour: number,
+ *                  intensity: number, distance: number, position: THREE.Vector3 }>,
+ *   bounds: THREE.Box3,
+ *   step: (dt: number) => void,
+ *   updateShadows: () => void
+ * }}
+ */
 export function createWorld(scene) {
+  if (!scene || typeof scene.add !== 'function') {
+    throw new TypeError('createWorld(scene): a THREE.Scene is required');
+  }
+
   const group = new THREE.Group();
   scene.add(group);
 
   const colliders = [];
   const shootables = [];
 
-  // --- boxes: one mesh each, materials shared through the cache ---
-  // Lamp boxes are never colliders and never shootable: they are unlit emissive fixtures
-  // that the charge-strip pulse animates via their basic material colour.
+  // --- boxes: one mesh each, materials shared through the cache ------------------
+  // Lamp boxes are never colliders and never shootable: they are unlit emissive
+  // fixtures that the charge-strip pulse animates via their basic material colour.
   const meshById = {};
   for (const b of BOXES) {
     const isLamp = b.mat === 'lamp';
-    const isGround = b.id === 'ground';
+    const isGround = b.id === GROUND_BOX_ID;
     const [rx, ry] = isLamp ? [1, 1] : repeatsFor(b.mat, b.w, b.h, b.d);
-    const mat = isLamp ? materialFor('lamp', 1, 1) : materialFor(b.mat, rx, ry);
+    const mat = materialFor(b.mat, rx, ry);
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(b.w, b.h, b.d), mat);
     mesh.position.set(b.x, b.y, b.z);
     mesh.castShadow = isLamp || isGround ? false : b.cast !== false;
-    mesh.receiveShadow = !isGround; // the ground slab only receives
+    mesh.receiveShadow = true; // every surface receives; the ground slab only receives
     group.add(mesh);
     meshById[b.id] = mesh;
     if (b.move && !isLamp) colliders.push(new THREE.Box3().setFromObject(mesh));
     if (b.bullet && !isLamp) shootables.push(mesh);
   }
 
-  // --- props: instanced + single meshes, barrels and pallets stop bullets ---
+  // --- props: instanced + single meshes, barrels and pallets stop bullets --------
   const stopProps = buildProps(group);
   shootables.push(...stopProps);
 
-  // --- signs ---
+  // --- signs --------------------------------------------------------------------
   buildSigns(group);
 
-  // --- point lights: capped at 8, no shadows; fixtures are the lamp boxes ---
-  // Three.js lights are physical now: intensity is candela, so a fixture recorded as
-  // 1.5 reads as a candle at 3 m. The gain turns the authored relative values into
-  // real harbour-lamp pools without changing their ratios.
-  const LAMP_GAIN = 40;
-  const lightDefs = LAMPS.slice(0, 8);
+  // --- point lights: capped, no shadows; fixtures are the lamp boxes ------------
+  // The gain turns the authored relative lamp values into real harbour-lamp pools
+  // without changing their ratios.
+  const lightDefs = LAMPS.slice(0, MAX_POINT_LIGHTS);
   const lampOut = [];
   for (const l of lightDefs) {
     const pl = new THREE.PointLight(l.colour, l.intensity * LAMP_GAIN, l.distance, 2);
@@ -848,99 +1192,57 @@ export function createWorld(scene) {
     lampOut.push({ ...l, position: new THREE.Vector3(l.x, l.y, l.z) });
   }
 
-  // --- atmosphere: night background, fog, sky dome, key light, fill ---
+  // --- atmosphere: night background, fog, sky dome, key light, fill -------------
   scene.background = new THREE.Color(PALETTE.night);
-  scene.fog = new THREE.Fog(PALETTE.night, 40, 220);
+  scene.fog = new THREE.Fog(PALETTE.night, FOG_NEAR, FOG_FAR);
+  buildSky(scene);
+  buildLighting(scene);
 
-  {
-    // sky dome: vertical night gradient with a low sodium glow on the north side
-    const canvas = document.createElement('canvas');
-    canvas.width = 256;
-    canvas.height = 256;
-    const ctx = canvas.getContext('2d');
-    const g = ctx.createLinearGradient(0, 256, 0, 0);
-    g.addColorStop(0, '#060a0c');
-    g.addColorStop(1, '#16242c');
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, 256, 256);
-    const glow = ctx.createRadialGradient(128, 210, 4, 128, 210, 130);
-    glow.addColorStop(0, 'rgba(255, 178, 87, 0.30)');
-    glow.addColorStop(1, 'rgba(255, 178, 87, 0)');
-    ctx.fillStyle = glow;
-    ctx.fillRect(0, 0, 256, 256);
-    const skyTex = new THREE.CanvasTexture(canvas);
-    skyTex.colorSpace = THREE.SRGBColorSpace;
-    const dome = new THREE.Mesh(
-      new THREE.SphereGeometry(400, 32, 16),
-      new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, fog: false })
-    );
-    scene.add(dome);
-  }
-
-  const sun = new THREE.DirectionalLight(0xffd9a8, 3.4);
-  sun.position.set(-40, 60, -50);
-  sun.target.position.set(0, 0, 0);
-  sun.castShadow = true;
-  sun.shadow.mapSize.set(2048, 2048);
-  sun.shadow.camera.left = -34;
-  sun.shadow.camera.right = 34;
-  sun.shadow.camera.top = 44;
-  sun.shadow.camera.bottom = -44;
-  sun.shadow.camera.near = 1;
-  sun.shadow.camera.far = 170;
-  sun.shadow.bias = -0.0006;
-  sun.shadow.normalBias = 0.02;
-  scene.add(sun, sun.target);
-
-  const hemi = new THREE.HemisphereLight(0x24323c, 0x0a0f12, 1.9);
-  scene.add(hemi);
-  const ambient = new THREE.AmbientLight(0x223038, 0.55);
-  scene.add(ambient);
-  // A cool counter-fill with no shadow: the warm key carves the north faces, this keeps
-  // the south and east faces from collapsing into a single black shape at night.
-  const moon = new THREE.DirectionalLight(0x9fc0dd, 0.6);
-  moon.position.set(48, 38, 62);
-  moon.target.position.set(0, 0, -6);
-  moon.castShadow = false;
-  scene.add(moon, moon.target);
-
-  // --- water ---
+  // --- water --------------------------------------------------------------------
   const water = buildWater(group);
 
-  // --- charge strips: hold base colours, pulse emissive on the existing basic materials ---
+  // --- charge strips: hold base colours, pulse emissive on the existing materials
+  // The two strip ids are resolved at build time; step(dt) only scales their
+  // existing basic-material colour.
   const strips = [];
   for (const b of BOXES) {
-    if (b.id.indexOf('a-charge-strip') === 0 || b.id.indexOf('b-charge-strip') === 0) {
-      const m = meshById[b.id];
-      // strips share one cached lamp material; give each its own colour to pulse from
-      m.material = m.material.clone();
-      strips.push({ mesh: m, base: m.material.color.clone() });
-    }
+    if (!isStripId(b.id)) continue;
+    const m = meshById[b.id];
+    if (!m) continue;
+    // strips share one cached lamp material; give each its own colour to pulse from
+    m.material = m.material.clone();
+    strips.push({ mesh: m, base: m.material.color.clone() });
   }
 
+  /**
+   * Advance the two cheap animations: water drift and the strip pulse. Allocates
+   * nothing and never touches the light rig.
+   * @param {number} dt seconds since the previous frame
+   */
   function step(dt) {
     water.t += dt;
     // two textures drift at slightly different rates and directions: the surface
     // appears to move, nothing is allocated or recreated here
-    water.texA.offset.x += dt * 0.004;
-    water.texB.offset.x -= dt * 0.0027;
-    water.texB.offset.y += dt * 0.0019;
-    // about 2.2 Hz sine pulse on the emissive colour, no lighting change
-    const pulse = 0.5 + 0.5 * Math.sin(water.t * 2.2 * Math.PI * 2);
-    const scale = 0.45 + 0.9 * pulse;
+    water.texA.offset.x += dt * DRIFT_A_X;
+    water.texB.offset.x += dt * DRIFT_B_X;
+    water.texB.offset.y += dt * DRIFT_B_Y;
+    // ~2.2 Hz sine pulse on the emissive colour, no lighting change
+    const pulse = 0.5 + 0.5 * Math.sin(water.t * STRIP_PULSE_HZ * TAU);
+    const scale = STRIP_PULSE_MIN + STRIP_PULSE_AMP * pulse;
     for (let i = 0; i < strips.length; i++) {
       strips[i].mesh.material.color.copy(strips[i].base).multiplyScalar(scale);
     }
   }
 
-  // --- nav: expose node links so A* walks an adjacency list instead of scanning edges ---
+  // --- nav: expose node links so A* walks an adjacency list instead of scanning edges
   const byName = {};
   for (const name of Object.keys(NAV.nodes)) {
+    const node = NAV.nodes[name];
     byName[name] = {
       name,
-      x: NAV.nodes[name].x,
-      y: NAV.nodes[name].y,
-      z: NAV.nodes[name].z,
+      x: node.x,
+      y: node.y,
+      z: node.z,
       links: [],
     };
   }
@@ -949,19 +1251,26 @@ export function createWorld(scene) {
     if (byName[b]) byName[b].links.push(a);
   }
 
-  // --- sites: attach the charge crate's world position to each site record ---
+  // --- sites: attach the charge crate's world position to each site record ------
   const sitesOut = {};
   for (const key of Object.keys(SITES)) {
     const site = { ...SITES[key] };
-    const crateId = key === 'a' ? 'a-charge' : 'b-charge';
-    const crate = meshById[crateId];
+    const crateId = CHARGE_CRATE_BY_SITE[key];
+    const crate = crateId ? meshById[crateId] : undefined;
+    const halfHeight =
+      crate && crate.geometry && crate.geometry.parameters
+        ? crate.geometry.parameters.h / 2
+        : 0.3;
     site.charge = crate
-      ? new THREE.Vector3(crate.position.x, crate.position.y + crate.geometry.parameters.h / 2, crate.position.z)
+      ? new THREE.Vector3(crate.position.x, crate.position.y + halfHeight, crate.position.z)
       : new THREE.Vector3(site.plant.x, site.plant.y + 0.3, site.plant.z);
     sitesOut[key] = site;
   }
 
-  const bounds = new THREE.Box3(new THREE.Vector3(-28, 0, -36), new THREE.Vector3(28, 7, 36));
+  const bounds = new THREE.Box3(
+    new THREE.Vector3(BOUNDS_MIN.x, BOUNDS_MIN.y, BOUNDS_MIN.z),
+    new THREE.Vector3(BOUNDS_MAX.x, BOUNDS_MAX.y, BOUNDS_MAX.z)
+  );
 
   return {
     group,
